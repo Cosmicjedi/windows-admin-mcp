@@ -14,7 +14,34 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libssl-dev \
     libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* || \
+    (apt-get update && apt-get install -y \
+    freerdp \
+    libfreerdp-dev \
+    xvfb \
+    x11vnc \
+    openssh-client \
+    iputils-ping \
+    net-tools \
+    curl \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/* || \
+    (apt-get update && apt-get install -y \
+    rdesktop \
+    xrdp \
+    xvfb \
+    x11vnc \
+    openssh-client \
+    iputils-ping \
+    net-tools \
+    curl \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*))
 
 # Set working directory
 WORKDIR /app
