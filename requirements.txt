@@ -4,3 +4,4 @@ aiofiles>=23.0.0
 python-dateutil>=2.8.2
 pywinrm>=0.4.3
 requests-ntlm>=1.2.0
+asyncssh>=2.13.0
