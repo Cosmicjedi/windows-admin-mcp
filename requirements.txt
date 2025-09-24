@@ -2,4 +2,5 @@ mcp[cli]>=1.2.0
 httpx
 aiofiles>=23.0.0
 python-dateutil>=2.8.2
-pexpect>=4.8.0
+pywinrm>=0.4.3
+requests-ntlm>=1.2.0
