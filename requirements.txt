@@ -1,0 +1,6 @@
+mcp[cli]>=1.2.0
+httpx
+pywinrm>=0.4.3
+paramiko>=3.0.0
+aiofiles>=23.0.0
+python-dateutil>=2.8.2
