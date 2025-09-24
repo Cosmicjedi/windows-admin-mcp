@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Windows Admin MCP Server - Remote Windows server administration and troubleshooting
+Windows Admin MCP Server - Remote Windows server administration via RDP protocol
 """
 import os
 import sys
@@ -8,12 +8,13 @@ import logging
 import json
 import subprocess
 import asyncio
+import tempfile
+import shlex
 from datetime import datetime
 from pathlib import Path
 import aiofiles
+import pexpect
 from mcp.server.fastmcp import FastMCP
-from winrm.protocol import Protocol
-import paramiko
 
 # Configure logging to stderr
 logging.basicConfig(
@@ -29,8 +30,6 @@ mcp = FastMCP("windows-admin")
 # Configuration
 LOG_DIR = os.environ.get("WINDOWS_ADMIN_LOG_DIR", "/app/logs")
 RDP_PORT = 3389
-WINRM_PORT = 5985
-WINRM_HTTPS_PORT = 5986
 
 # Ensure log directory exists
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -52,36 +51,131 @@ async def write_log(hostname: str, message: str):
     except Exception as e:
         logger.error(f"Failed to write log: {e}")
 
-def establish_winrm_connection(hostname: str, username: str, password: str):
-    """Establish WinRM connection to Windows server."""
+async def execute_rdp_powershell(hostname: str, username: str, password: str, command: str, timeout: int = 30):
+    """Execute PowerShell command through RDP protocol using xfreerdp."""
     try:
-        endpoint = f"http://{hostname}:{WINRM_PORT}/wsman"
-        protocol = Protocol(
-            endpoint=endpoint,
-            transport='ntlm',
-            username=username,
-            password=password,
-            server_cert_validation='ignore'
+        # Create a temporary script file for the PowerShell command
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False) as f:
+            # Script that executes command and captures output
+            script_content = f"""
+$ErrorActionPreference = 'Continue'
+$output = @{{
+    stdout = ''
+    stderr = ''
+    status = 0
+}}
+try {{
+    $result = {command} 2>&1
+    if ($result -is [System.Management.Automation.ErrorRecord]) {{
+        $output.stderr = $result.Exception.Message
+        $output.status = 1
+    }} else {{
+        $output.stdout = $result | Out-String
+    }}
+}} catch {{
+    $output.stderr = $_.Exception.Message
+    $output.status = 1
+}}
+$output | ConvertTo-Json | Out-File -FilePath C:\\Temp\\rdp_output.json -Encoding UTF8
+"""
+            f.write(script_content)
+            script_path = f.name
+        
+        # Build xfreerdp command to execute PowerShell through RDP
+        # Using RemoteApp mode to run PowerShell directly
+        rdp_command = [
+            "xfreerdp",
+            f"/v:{hostname}:{RDP_PORT}",
+            f"/u:{username}",
+            f"/p:{password}",
+            "/cert-ignore",
+            "/compression",
+            "/auto-reconnect",
+            "/app:||powershell",
+            f"/app-cmd:-ExecutionPolicy Bypass -File {script_path}",
+            "/log-level:ERROR",
+            "+clipboard",
+            "/timeout:30000"
+        ]
+        
+        # Execute via subprocess
+        process = await asyncio.create_subprocess_exec(
+            *rdp_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "DISPLAY": ":99"}  # Use virtual display
         )
-        return protocol
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
+            )
+            
+            # Try to retrieve the output file via RDP shared folder or clipboard
+            # For now, parse from the RDP session output
+            output = stdout.decode('utf-8', errors='ignore')
+            error = stderr.decode('utf-8', errors='ignore')
+            
+            return {
+                'stdout': output,
+                'stderr': error,
+                'status': process.returncode or 0
+            }
+            
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return {
+                'stdout': '',
+                'stderr': 'Command timed out',
+                'status': -1
+            }
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(script_path)
+            except:
+                pass
+                
     except Exception as e:
-        logger.error(f"WinRM connection failed: {e}")
-        return None
+        logger.error(f"RDP PowerShell execution error: {e}")
+        return {
+            'stdout': '',
+            'stderr': str(e),
+            'status': -1
+        }
 
-async def execute_powershell_command(protocol, command: str):
-    """Execute PowerShell command via WinRM."""
+async def execute_rdp_command_alternative(hostname: str, username: str, password: str, command: str):
+    """Alternative method using rdesktop for command execution."""
     try:
-        shell_id = protocol.open_shell()
-        command_id = protocol.run_command(shell_id, 'powershell', ['-Command', command])
-        std_out, std_err, status_code = protocol.get_command_output(shell_id, command_id)
-        protocol.cleanup_command(shell_id, command_id)
-        protocol.close_shell(shell_id)
+        # Create a batch file with the PowerShell command
+        batch_content = f"""@echo off
+powershell.exe -ExecutionPolicy Bypass -Command "{command}" > C:\\Temp\\output.txt 2>&1
+type C:\\Temp\\output.txt
+"""
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as f:
+            f.write(batch_content)
+            batch_path = f.name
+        
+        # Use rdesktop with seamless mode to execute command
+        rdp_cmd = f"rdesktop -u {username} -p {password} -s 'cmd.exe /c {batch_path}' -r clipboard:PRIMARYCLIPBOARD {hostname}"
+        
+        process = await asyncio.create_subprocess_shell(
+            rdp_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
         
         return {
-            'stdout': std_out.decode('utf-8') if std_out else '',
-            'stderr': std_err.decode('utf-8') if std_err else '',
-            'status': status_code
+            'stdout': stdout.decode('utf-8', errors='ignore'),
+            'stderr': stderr.decode('utf-8', errors='ignore'),
+            'status': process.returncode or 0
         }
+        
     except Exception as e:
         return {
             'stdout': '',
@@ -121,21 +215,37 @@ async def test_connection(hostname: str = "", username: str = "", password: str 
         rdp_open = rdp_result == 0
         await write_log(hostname, f"RDP port {RDP_PORT}: {'Open' if rdp_open else 'Closed'}")
         
-        # Test WinRM if credentials provided
-        winrm_status = "Not tested (no credentials)"
+        # Test RDP authentication if credentials provided
+        rdp_auth_status = "Not tested (no credentials)"
         if username.strip() and password.strip():
-            protocol = establish_winrm_connection(hostname, username, password)
-            if protocol:
-                winrm_status = "✅ Connected"
-                await write_log(hostname, "WinRM connection successful")
+            # Quick RDP auth test using xfreerdp
+            test_cmd = [
+                "timeout", "5",
+                "xfreerdp",
+                f"/v:{hostname}:{RDP_PORT}",
+                f"/u:{username}",
+                f"/p:{password}",
+                "/cert-ignore",
+                "/auth-only"
+            ]
+            
+            test_process = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                text=True
+            )
+            
+            if "Authentication only" in test_process.stdout or test_process.returncode == 0:
+                rdp_auth_status = "✅ Authentication successful"
+                await write_log(hostname, "RDP authentication successful")
             else:
-                winrm_status = "❌ Failed"
-                await write_log(hostname, "WinRM connection failed")
+                rdp_auth_status = "❌ Authentication failed"
+                await write_log(hostname, "RDP authentication failed")
         
         return f"""🌐 Connection Test Results for {hostname}:
 - Ping: {'✅ Successful' if ping_success else '❌ Failed'}
 - RDP Port {RDP_PORT}: {'✅ Open' if rdp_open else '❌ Closed'}
-- WinRM: {winrm_status}
+- RDP Authentication: {rdp_auth_status}
 
 Logs saved to: {hostname}-{datetime.now().strftime('%m%d%Y')}.log"""
         
@@ -145,50 +255,43 @@ Logs saved to: {hostname}-{datetime.now().strftime('%m%d%Y')}.log"""
 
 @mcp.tool()
 async def diagnose_system(hostname: str = "", username: str = "", password: str = "", issue_description: str = "") -> str:
-    """Diagnose system issues by gathering comprehensive system information."""
+    """Diagnose system issues by gathering comprehensive system information via RDP."""
     if not hostname.strip() or not username.strip() or not password.strip():
         return "❌ Error: Hostname, username, and password are required"
     
-    await write_log(hostname, f"Starting system diagnosis - Issue: {issue_description}")
+    await write_log(hostname, f"Starting system diagnosis via RDP - Issue: {issue_description}")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
-        
         diagnostics = {}
         
-        # System information
+        # System information commands
         commands = {
-            "OS Info": "Get-WmiObject Win32_OperatingSystem | Select Caption, Version, BuildNumber, LastBootUpTime",
-            "CPU Usage": "Get-WmiObject Win32_Processor | Select LoadPercentage, Name",
-            "Memory Usage": "Get-WmiObject Win32_OperatingSystem | Select TotalVisibleMemorySize, FreePhysicalMemory",
-            "Disk Space": "Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=3' | Select DeviceID, Size, FreeSpace",
-            "Running Services": "Get-Service | Where-Object {$_.Status -eq 'Running'} | Select -First 10 Name, DisplayName",
-            "Event Log Errors": "Get-EventLog -LogName System -EntryType Error -Newest 5 | Select TimeGenerated, Source, Message",
-            "Network Config": "Get-NetIPConfiguration | Select InterfaceAlias, IPv4Address, IPv6Address"
+            "OS Info": "Get-WmiObject Win32_OperatingSystem | Select Caption, Version, BuildNumber, LastBootUpTime | Format-List",
+            "CPU Usage": "Get-WmiObject Win32_Processor | Select LoadPercentage, Name | Format-List",
+            "Memory Usage": "Get-WmiObject Win32_OperatingSystem | Select TotalVisibleMemorySize, FreePhysicalMemory | Format-List",
+            "Disk Space": "Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=3' | Select DeviceID, Size, FreeSpace | Format-Table",
+            "Running Services": "Get-Service | Where-Object {$_.Status -eq 'Running'} | Select -First 10 Name, DisplayName | Format-Table",
+            "Event Log Errors": "Get-EventLog -LogName System -EntryType Error -Newest 5 | Select TimeGenerated, Source, Message | Format-List"
         }
         
         for name, command in commands.items():
-            result = await execute_powershell_command(protocol, command)
-            diagnostics[name] = result['stdout'] if result['status'] == 0 else result['stderr']
-            await write_log(hostname, f"Executed diagnostic: {name}")
+            result = await execute_rdp_powershell(hostname, username, password, command)
+            diagnostics[name] = result['stdout'] if result['status'] == 0 else f"Error: {result['stderr']}"
+            await write_log(hostname, f"Executed diagnostic via RDP: {name}")
         
         # Analyze for specific issues if description provided
         if issue_description.strip():
             if "crash" in issue_description.lower() or "stop" in issue_description.lower():
                 # Check application event logs
-                app_logs = await execute_powershell_command(
-                    protocol,
-                    "Get-EventLog -LogName Application -EntryType Error -Newest 10 | Select TimeGenerated, Source, Message"
-                )
+                app_cmd = "Get-EventLog -LogName Application -EntryType Error -Newest 10 | Select TimeGenerated, Source, Message | Format-List"
+                app_logs = await execute_rdp_powershell(hostname, username, password, app_cmd)
                 diagnostics["Application Errors"] = app_logs['stdout']
-                await write_log(hostname, "Checked application event logs for crashes")
+                await write_log(hostname, "Checked application event logs via RDP for crashes")
         
-        await write_log(hostname, "System diagnosis completed")
+        await write_log(hostname, "System diagnosis via RDP completed")
         
         # Format results
-        output = f"📊 System Diagnostics for {hostname}:\n\n"
+        output = f"📊 System Diagnostics for {hostname} (via RDP):\n\n"
         for category, data in diagnostics.items():
             output += f"=== {category} ===\n{data[:500]}...\n\n"  # Truncate long outputs
         
@@ -197,78 +300,66 @@ async def diagnose_system(hostname: str = "", username: str = "", password: str 
         return output
         
     except Exception as e:
-        await write_log(hostname, f"Diagnosis error: {str(e)}")
-        return f"❌ Diagnosis error: {str(e)}"
+        await write_log(hostname, f"RDP diagnosis error: {str(e)}")
+        return f"❌ RDP diagnosis error: {str(e)}"
 
 @mcp.tool()
 async def execute_command(hostname: str = "", username: str = "", password: str = "", command: str = "", command_type: str = "powershell") -> str:
-    """Execute a PowerShell or CMD command on the remote Windows server."""
+    """Execute a PowerShell or CMD command on the remote Windows server via RDP."""
     if not all([hostname.strip(), username.strip(), password.strip(), command.strip()]):
         return "❌ Error: All parameters (hostname, username, password, command) are required"
     
-    await write_log(hostname, f"Executing {command_type} command: {command}")
+    await write_log(hostname, f"Executing {command_type} command via RDP: {command}")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
-        
         if command_type.lower() == "cmd":
-            # Execute as CMD command
-            shell_id = protocol.open_shell()
-            command_id = protocol.run_command(shell_id, 'cmd', ['/c', command])
-            std_out, std_err, status_code = protocol.get_command_output(shell_id, command_id)
-            protocol.cleanup_command(shell_id, command_id)
-            protocol.close_shell(shell_id)
+            # Wrap CMD command for execution via PowerShell through RDP
+            full_command = f"cmd /c {command}"
         else:
             # Execute as PowerShell command (default)
-            result = await execute_powershell_command(protocol, command)
-            std_out = result['stdout'].encode('utf-8')
-            std_err = result['stderr'].encode('utf-8')
-            status_code = result['status']
+            full_command = command
         
-        output = std_out.decode('utf-8') if std_out else ''
-        error = std_err.decode('utf-8') if std_err else ''
+        result = await execute_rdp_powershell(hostname, username, password, full_command, timeout=60)
         
-        await write_log(hostname, f"Command executed with status {status_code}")
+        output = result['stdout']
+        error = result['stderr']
+        status_code = result['status']
+        
+        await write_log(hostname, f"RDP command executed with status {status_code}")
         
         if status_code == 0:
-            return f"✅ Command executed successfully:\n\nOutput:\n{output}"
+            return f"✅ Command executed successfully via RDP:\n\nOutput:\n{output}"
         else:
             return f"⚠️ Command completed with status {status_code}:\n\nOutput:\n{output}\n\nError:\n{error}"
         
     except Exception as e:
-        await write_log(hostname, f"Command execution error: {str(e)}")
-        return f"❌ Command execution error: {str(e)}"
+        await write_log(hostname, f"RDP command execution error: {str(e)}")
+        return f"❌ RDP command execution error: {str(e)}"
 
 @mcp.tool()
 async def check_service(hostname: str = "", username: str = "", password: str = "", service_name: str = "") -> str:
-    """Check the status of a specific Windows service and provide options to manage it."""
+    """Check the status of a specific Windows service via RDP."""
     if not all([hostname.strip(), username.strip(), password.strip(), service_name.strip()]):
         return "❌ Error: All parameters are required"
     
-    await write_log(hostname, f"Checking service: {service_name}")
+    await write_log(hostname, f"Checking service via RDP: {service_name}")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
-        
         # Get service status
-        status_cmd = f"Get-Service -Name '{service_name}' | Select Name, Status, DisplayName, StartType"
-        result = await execute_powershell_command(protocol, status_cmd)
+        status_cmd = f"Get-Service -Name '{service_name}' | Select Name, Status, DisplayName, StartType | Format-List"
+        result = await execute_rdp_powershell(hostname, username, password, status_cmd)
         
-        if result['status'] != 0:
-            await write_log(hostname, f"Service {service_name} not found")
+        if result['status'] != 0 or "Cannot find" in result['stderr']:
+            await write_log(hostname, f"Service {service_name} not found via RDP")
             return f"❌ Service '{service_name}' not found. Error: {result['stderr']}"
         
         # Get service dependencies
-        deps_cmd = f"Get-Service -Name '{service_name}' | Select -ExpandProperty DependentServices | Select Name, Status"
-        deps_result = await execute_powershell_command(protocol, deps_cmd)
+        deps_cmd = f"Get-Service -Name '{service_name}' | Select -ExpandProperty DependentServices | Select Name, Status | Format-Table"
+        deps_result = await execute_rdp_powershell(hostname, username, password, deps_cmd)
         
-        await write_log(hostname, f"Service {service_name} status retrieved")
+        await write_log(hostname, f"Service {service_name} status retrieved via RDP")
         
-        return f"""🔧 Service Status for '{service_name}' on {hostname}:
+        return f"""🔧 Service Status for '{service_name}' on {hostname} (via RDP):
 
 {result['stdout']}
 
@@ -281,54 +372,50 @@ Available actions:
 - To restart: execute_command with 'Restart-Service -Name {service_name}'"""
         
     except Exception as e:
-        await write_log(hostname, f"Service check error: {str(e)}")
-        return f"❌ Service check error: {str(e)}"
+        await write_log(hostname, f"RDP service check error: {str(e)}")
+        return f"❌ RDP service check error: {str(e)}"
 
 @mcp.tool()
 async def troubleshoot_application(hostname: str = "", username: str = "", password: str = "", app_name: str = "") -> str:
-    """Troubleshoot a specific application that is crashing or not working properly."""
+    """Troubleshoot a specific application that is crashing or not working properly via RDP."""
     if not all([hostname.strip(), username.strip(), password.strip(), app_name.strip()]):
         return "❌ Error: All parameters are required"
     
-    await write_log(hostname, f"Troubleshooting application: {app_name}")
+    await write_log(hostname, f"Troubleshooting application via RDP: {app_name}")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
-        
         findings = []
         
         # Check if process is running
-        process_cmd = f"Get-Process -Name '*{app_name}*' -ErrorAction SilentlyContinue | Select Name, Id, CPU, WorkingSet"
-        process_result = await execute_powershell_command(protocol, process_cmd)
+        process_cmd = f"Get-Process -Name '*{app_name}*' -ErrorAction SilentlyContinue | Select Name, Id, CPU, WorkingSet | Format-Table"
+        process_result = await execute_rdp_powershell(hostname, username, password, process_cmd)
         
-        if process_result['stdout'].strip():
+        if process_result['stdout'].strip() and "Name" in process_result['stdout']:
             findings.append(f"✅ Application processes found:\n{process_result['stdout']}")
         else:
             findings.append(f"❌ No running processes found for '{app_name}'")
         
-        await write_log(hostname, f"Process check completed for {app_name}")
+        await write_log(hostname, f"Process check completed via RDP for {app_name}")
         
         # Check application event logs
-        event_cmd = f"Get-EventLog -LogName Application -Source '*{app_name}*' -Newest 10 -ErrorAction SilentlyContinue | Select TimeGenerated, EntryType, Message"
-        event_result = await execute_powershell_command(protocol, event_cmd)
+        event_cmd = f"Get-EventLog -LogName Application -Newest 20 | Where-Object {{$_.Source -like '*{app_name}*' -or $_.Message -like '*{app_name}*'}} | Select -First 5 TimeGenerated, EntryType, Message | Format-List"
+        event_result = await execute_rdp_powershell(hostname, username, password, event_cmd)
         
         if event_result['stdout'].strip():
             findings.append(f"📋 Recent application events:\n{event_result['stdout'][:1000]}")
         
         # Check Windows Error Reporting
-        wer_cmd = f"Get-WinEvent -FilterHashtable @{{LogName='Application'; ProviderName='Windows Error Reporting'}} -MaxEvents 5 | Where-Object {{$_.Message -like '*{app_name}*'}} | Select TimeCreated, Message"
-        wer_result = await execute_powershell_command(protocol, wer_cmd)
+        wer_cmd = f"Get-EventLog -LogName Application -Source 'Application Error' -Newest 10 | Where-Object {{$_.Message -like '*{app_name}*'}} | Select -First 3 TimeGenerated, Message | Format-List"
+        wer_result = await execute_rdp_powershell(hostname, username, password, wer_cmd)
         
         if wer_result['stdout'].strip():
             findings.append(f"⚠️ Windows Error Reports:\n{wer_result['stdout'][:1000]}")
         
-        await write_log(hostname, f"Event log check completed for {app_name}")
+        await write_log(hostname, f"Event log check completed via RDP for {app_name}")
         
-        # Check application files/installation
-        install_cmd = f"Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object {{$_.DisplayName -like '*{app_name}*'}} | Select DisplayName, InstallLocation, DisplayVersion"
-        install_result = await execute_powershell_command(protocol, install_cmd)
+        # Check application installation
+        install_cmd = f"Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object {{$_.DisplayName -like '*{app_name}*'}} | Select DisplayName, InstallLocation, DisplayVersion | Format-List"
+        install_result = await execute_rdp_powershell(hostname, username, password, install_cmd)
         
         if install_result['stdout'].strip():
             findings.append(f"📦 Installation info:\n{install_result['stdout']}")
@@ -342,9 +429,9 @@ async def troubleshoot_application(hostname: str = "", username: str = "", passw
             recommendations.append("• Consider reinstalling or updating the application")
             recommendations.append("• Check for missing dependencies or DLL files")
         
-        await write_log(hostname, f"Troubleshooting completed for {app_name}")
+        await write_log(hostname, f"Troubleshooting completed via RDP for {app_name}")
         
-        output = f"🔍 Troubleshooting Report for '{app_name}' on {hostname}:\n\n"
+        output = f"🔍 Troubleshooting Report for '{app_name}' on {hostname} (via RDP):\n\n"
         output += "\n\n".join(findings)
         
         if recommendations:
@@ -355,30 +442,26 @@ async def troubleshoot_application(hostname: str = "", username: str = "", passw
         return output
         
     except Exception as e:
-        await write_log(hostname, f"Application troubleshooting error: {str(e)}")
-        return f"❌ Troubleshooting error: {str(e)}"
+        await write_log(hostname, f"Application troubleshooting via RDP error: {str(e)}")
+        return f"❌ RDP troubleshooting error: {str(e)}"
 
 @mcp.tool()
 async def apply_solution(hostname: str = "", username: str = "", password: str = "", solution_script: str = "") -> str:
-    """Apply a PowerShell solution script to fix identified issues on the Windows server."""
+    """Apply a PowerShell solution script via RDP to fix identified issues."""
     if not all([hostname.strip(), username.strip(), password.strip(), solution_script.strip()]):
         return "❌ Error: All parameters are required"
     
-    await write_log(hostname, f"Applying solution script")
+    await write_log(hostname, f"Applying solution script via RDP")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
+        # Execute the solution script via RDP
+        result = await execute_rdp_powershell(hostname, username, password, solution_script, timeout=120)
         
-        # Execute the solution script
-        result = await execute_powershell_command(protocol, solution_script)
-        
-        await write_log(hostname, f"Solution script executed with status {result['status']}")
+        await write_log(hostname, f"Solution script executed via RDP with status {result['status']}")
         await write_log(hostname, f"Script output: {result['stdout'][:500]}")
         
         if result['status'] == 0:
-            return f"""✅ Solution successfully applied on {hostname}:
+            return f"""✅ Solution successfully applied via RDP on {hostname}:
 
 Script executed:
 {solution_script[:500]}{'...' if len(solution_script) > 500 else ''}
@@ -401,66 +484,62 @@ Errors:
 📁 Logs saved to: {hostname}-{datetime.now().strftime('%m%d%Y')}.log"""
         
     except Exception as e:
-        await write_log(hostname, f"Solution application error: {str(e)}")
-        return f"❌ Solution application error: {str(e)}"
+        await write_log(hostname, f"Solution application via RDP error: {str(e)}")
+        return f"❌ RDP solution application error: {str(e)}"
 
 @mcp.tool()
 async def get_performance_metrics(hostname: str = "", username: str = "", password: str = "") -> str:
-    """Get current performance metrics from the Windows server including CPU, memory, disk, and network."""
+    """Get current performance metrics from the Windows server via RDP."""
     if not all([hostname.strip(), username.strip(), password.strip()]):
         return "❌ Error: Hostname, username, and password are required"
     
-    await write_log(hostname, f"Retrieving performance metrics")
+    await write_log(hostname, f"Retrieving performance metrics via RDP")
     
     try:
-        protocol = establish_winrm_connection(hostname, username, password)
-        if not protocol:
-            return "❌ Failed to establish WinRM connection"
-        
         metrics = {}
         
         # CPU metrics
-        cpu_cmd = "Get-WmiObject Win32_Processor | Select Name, LoadPercentage, NumberOfCores, MaxClockSpeed"
-        cpu_result = await execute_powershell_command(protocol, cpu_cmd)
+        cpu_cmd = "Get-WmiObject Win32_Processor | Select Name, LoadPercentage, NumberOfCores, MaxClockSpeed | Format-List"
+        cpu_result = await execute_rdp_powershell(hostname, username, password, cpu_cmd)
         metrics['CPU'] = cpu_result['stdout']
         
         # Memory metrics
         mem_cmd = """$OS = Get-WmiObject Win32_OperatingSystem
-$TotalMem = [math]::Round($OS.TotalVisibleMemorySize/1MB, 2)
-$FreeMem = [math]::Round($OS.FreePhysicalMemory/1MB, 2)
+$TotalMem = [math]::Round($OS.TotalVisibleMemorySize/1048576, 2)
+$FreeMem = [math]::Round($OS.FreePhysicalMemory/1048576, 2)
 $UsedMem = $TotalMem - $FreeMem
 $PercentUsed = [math]::Round(($UsedMem/$TotalMem)*100, 2)
 Write-Output "Total Memory: $TotalMem GB"
-Write-Output "Used Memory: $UsedMem GB"
+Write-Output "Used Memory: $UsedMem GB"  
 Write-Output "Free Memory: $FreeMem GB"
 Write-Output "Memory Usage: $PercentUsed%"""
-        mem_result = await execute_powershell_command(protocol, mem_cmd)
+        mem_result = await execute_rdp_powershell(hostname, username, password, mem_cmd)
         metrics['Memory'] = mem_result['stdout']
         
         # Disk metrics
         disk_cmd = """Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
-    $SizeGB = [math]::Round($_.Size/1GB, 2)
-    $FreeGB = [math]::Round($_.FreeSpace/1GB, 2)
+    $SizeGB = [math]::Round($_.Size/1073741824, 2)
+    $FreeGB = [math]::Round($_.FreeSpace/1073741824, 2)
     $UsedGB = $SizeGB - $FreeGB
-    $PercentFree = [math]::Round(($_.FreeSpace/$_.Size)*100, 2)
+    $PercentFree = if($_.Size -gt 0) {[math]::Round(($_.FreeSpace/$_.Size)*100, 2)} else {0}
     Write-Output "Drive $($_.DeviceID) - Total: $SizeGB GB, Used: $UsedGB GB, Free: $FreeGB GB ($PercentFree% free)"
 }"""
-        disk_result = await execute_powershell_command(protocol, disk_cmd)
+        disk_result = await execute_rdp_powershell(hostname, username, password, disk_cmd)
         metrics['Disk'] = disk_result['stdout']
         
         # Network metrics
         net_cmd = "Get-NetAdapterStatistics | Select Name, ReceivedBytes, SentBytes | Format-Table"
-        net_result = await execute_powershell_command(protocol, net_cmd)
+        net_result = await execute_rdp_powershell(hostname, username, password, net_cmd)
         metrics['Network'] = net_result['stdout']
         
         # Top processes by CPU
         proc_cmd = "Get-Process | Sort-Object CPU -Descending | Select -First 5 Name, CPU, WorkingSet | Format-Table"
-        proc_result = await execute_powershell_command(protocol, proc_cmd)
+        proc_result = await execute_rdp_powershell(hostname, username, password, proc_cmd)
         metrics['Top Processes'] = proc_result['stdout']
         
-        await write_log(hostname, "Performance metrics retrieved successfully")
+        await write_log(hostname, "Performance metrics retrieved successfully via RDP")
         
-        output = f"📊 Performance Metrics for {hostname}:\n\n"
+        output = f"📊 Performance Metrics for {hostname} (via RDP):\n\n"
         for category, data in metrics.items():
             output += f"=== {category} ===\n{data}\n"
         
@@ -469,8 +548,8 @@ Write-Output "Memory Usage: $PercentUsed%"""
         return output
         
     except Exception as e:
-        await write_log(hostname, f"Performance metrics error: {str(e)}")
-        return f"❌ Performance metrics error: {str(e)}"
+        await write_log(hostname, f"Performance metrics via RDP error: {str(e)}")
+        return f"❌ RDP performance metrics error: {str(e)}"
 
 @mcp.tool()
 async def view_logs(hostname: str = "", date: str = "") -> str:
@@ -511,6 +590,14 @@ async def view_logs(hostname: str = "", date: str = "") -> str:
 if __name__ == "__main__":
     logger.info("Starting Windows Admin MCP server...")
     logger.info(f"Log directory: {LOG_DIR}")
+    logger.info("Using RDP protocol for remote command execution")
+    
+    # Start virtual display for RDP operations
+    try:
+        xvfb_process = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1024x768x16"])
+        logger.info("Virtual display started for RDP operations")
+    except Exception as e:
+        logger.warning(f"Could not start virtual display: {e}")
     
     try:
         mcp.run(transport='stdio')

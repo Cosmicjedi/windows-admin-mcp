@@ -1,14 +1,19 @@
 # Use Python slim image
 FROM python:3.11-slim
 
-# Install system dependencies for RDP and network tools
+# Install system dependencies for RDP protocol and tools
 RUN apt-get update && apt-get install -y \
     freerdp2-x11 \
-    xrdp \
+    freerdp2-dev \
+    xvfb \
+    x11vnc \
     openssh-client \
     iputils-ping \
     net-tools \
     curl \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
